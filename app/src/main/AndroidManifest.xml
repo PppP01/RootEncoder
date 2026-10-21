@@ -73,9 +73,20 @@
         android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
         tools:ignore="DiscouragedApi" />
 
-    <service android:name="com.pedro.streamer.screen.ScreenService"
+    <service
+        android:name=".screen.ScreenService"
+        android:enabled="true"
+        android:exported="false"
         android:foregroundServiceType="mediaProjection|microphone|camera"
-        />
+        android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+        <intent-filter>
+            <action android:name="android.accessibilityservice.AccessibilityService" />
+        </intent-filter>
+        <meta-data
+            android:name="android.accessibilityservice"
+            android:resource="@xml/accessibility_service_config" />
+    </service>
+      
   </application>
 
 </manifest>
