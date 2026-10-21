@@ -1,34 +1,18 @@
-/*
- * Copyright (C) 2024 pedroSG94.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.pedro.streamer.screen
 
+import android.accessibilityservice.AccessibilityService
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
 import android.content.Intent
+import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.os.IBinder
-import android.util.Log
+import android.view.accessibility.AccessibilityEvent
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import com.pedro.common.ConnectChecker
-import com.pedro.encoder.input.sources.audio.AudioSource
+import com.pedro.common.VideoCodec
 import com.pedro.encoder.input.sources.audio.InternalAudioSource
 import com.pedro.encoder.input.sources.audio.MicrophoneSource
 import com.pedro.encoder.input.sources.audio.MixAudioSource
@@ -36,22 +20,18 @@ import com.pedro.encoder.input.sources.video.NoVideoSource
 import com.pedro.encoder.input.sources.video.ScreenSource
 import com.pedro.library.base.recording.RecordController
 import com.pedro.library.generic.GenericStream
+import com.pedro.library.util.BitrateAdapter
 import com.pedro.streamer.R
 import com.pedro.streamer.utils.PathUtils
-import com.pedro.streamer.utils.toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-
-/**
- * Basic Screen service streaming implementation
- */
 @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
-class ScreenService: Service(), ConnectChecker {
+class ScreenService: AccessibilityService(), ConnectChecker {
 
   companion object {
-    private const val TAG = "DisplayService"
+    private const val TAG = "ScreenService"
     private const val CHANNEL_ID = "DisplayStreamChannel"
     const val NOTIFY_ID = 123456
     var INSTANCE: ScreenService? = null
@@ -64,40 +44,39 @@ class ScreenService: Service(), ConnectChecker {
     applicationContext.getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
   }
   private var callback: ConnectChecker? = null
-  private val width = 640
-  private val height = 480
-  private val vBitrate = 1200 * 1000
-  private var rotation = 90 //0 for landscape or 90 for portrait
-  private val sampleRate = 32000
+  private val width = 2560
+  private val height = 1440
+  private val vBitrate = 16000 * 1000
+  private var rotation = 0
+  private val sampleRate = 48000
   private val isStereo = true
-  private val aBitrate = 128 * 1000
-  private var prepared = false
+  private val aBitrate = 192 * 1000
   private var recordPath = ""
   private var selectedAudioSource: Int = R.id.audio_source_microphone
+  private val source = MediaRecorder.AudioSource.MIC
+  private var bitrateAdapter: BitrateAdapter? = null
+
+  private var prepared = false
 
   override fun onCreate() {
     super.onCreate()
-    Log.i(TAG, "RTP Display service create")
+    INSTANCE = this
     notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       val channel = NotificationChannel(CHANNEL_ID, CHANNEL_ID, NotificationManager.IMPORTANCE_HIGH)
       notificationManager?.createNotificationChannel(channel)
     }
-    genericStream = GenericStream(baseContext, this, NoVideoSource(), MicrophoneSource()).apply {
-      //This is important to keep a constant fps because media projection only produce fps if the screen change
-      getGlInterface().setForceRender(true, 15)
+    genericStream = GenericStream(baseContext, this, NoVideoSource(), MicrophoneSource(audioSource = source)).apply {
+      getGlInterface().autoHandleOrientation = true
+      getGlInterface().setForceRender(true, 60)
+      setVideoCodec(VideoCodec.H265)
     }
     prepared = try {
-      genericStream.prepareVideo(width, height, vBitrate, rotation = rotation) &&
-          genericStream.prepareAudio(sampleRate, isStereo, aBitrate,
-            echoCanceler = true,
-            noiseSuppressor = true
-          )
-    } catch (_: IllegalArgumentException) {
+      genericStream.prepareVideo(width, height, vBitrate, fps = 60, iFrameInterval = 2, rotation = rotation) &&
+        genericStream.prepareAudio(sampleRate, isStereo, aBitrate, echoCanceler = true, noiseSuppressor = true)
+    } catch (e: IllegalArgumentException) {
       false
     }
-    if (prepared) INSTANCE = this
-    else toast("Invalid audio or video parameters, prepare failed")
   }
 
   private fun keepAliveTrick() {
@@ -109,26 +88,30 @@ class ScreenService: Service(), ConnectChecker {
     startForeground(1, notification)
   }
 
-  override fun onBind(p0: Intent?): IBinder? {
-    return null
-  }
+  override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+  override fun onInterrupt() {}
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    Log.i(TAG, "RTP Display service started")
+    INSTANCE = this
+    keepAliveTrick()
     return START_STICKY
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+    genericStream.release()
+    mediaProjection?.stop()
+    INSTANCE = null
   }
 
   fun sendIntent(): Intent {
     return mediaProjectionManager.createScreenCaptureIntent()
   }
 
-  fun isStreaming(): Boolean {
-    return genericStream.isStreaming
-  }
+  fun isStreaming(): Boolean = genericStream.isStreaming
 
-  fun isRecording(): Boolean {
-    return genericStream.isRecording
-  }
+  fun isRecording(): Boolean = genericStream.isRecording
 
   fun stopStream() {
     if (genericStream.isStreaming) {
@@ -137,45 +120,35 @@ class ScreenService: Service(), ConnectChecker {
     }
   }
 
-  fun setCallback(connectChecker: ConnectChecker?) {
-    callback = connectChecker
-  }
-
-  override fun onDestroy() {
-    super.onDestroy()
-    Log.i(TAG, "RTP Display service destroy")
-    stopStream()
-    INSTANCE = null
-    //release stream and media projection properly
-    genericStream.release()
-    mediaProjection?.stop()
-    mediaProjection = null
+  fun checkIfPrepared(): Boolean {
+    return prepared
   }
 
   fun prepareStream(resultCode: Int, data: Intent): Boolean {
     keepAliveTrick()
     stopStream()
-    mediaProjection?.stop()
-    val mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data) ?: throw IllegalStateException("get MediaProjection failed")
+    if (genericStream.isRecording) genericStream.stopRecord()
+    val mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
     this.mediaProjection = mediaProjection
     val screenSource = ScreenSource(applicationContext, mediaProjection)
     return try {
+      genericStream.getGlInterface().setForceRender(true, 60)
       genericStream.changeVideoSource(screenSource)
       toggleAudioSource(selectedAudioSource)
       true
-    } catch (_: IllegalArgumentException) {
+    } catch (ignored: IllegalArgumentException) {
       false
     }
   }
 
-  fun getCurrentAudioSource(): AudioSource = genericStream.audioSource
+  fun getCurrentAudioSource(): Int = selectedAudioSource
 
   fun toggleAudioSource(itemId: Int) {
     when (itemId) {
       R.id.audio_source_microphone -> {
         selectedAudioSource = R.id.audio_source_microphone
         if (genericStream.audioSource is MicrophoneSource) return
-        genericStream.changeAudioSource(MicrophoneSource())
+        genericStream.changeAudioSource(MicrophoneSource(audioSource = source))
       }
       R.id.audio_source_internal -> {
         selectedAudioSource = R.id.audio_source_internal
@@ -190,7 +163,13 @@ class ScreenService: Service(), ConnectChecker {
         selectedAudioSource = R.id.audio_source_mix
         if (genericStream.audioSource is MixAudioSource) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-          mediaProjection?.let { genericStream.changeAudioSource(MixAudioSource(it)) }
+          mediaProjection?.let {
+            val mixSource = MixAudioSource(it, microphoneAudioSource = source).apply {
+              internalVolume = 0.55f
+              microphoneVolume = 1.0f
+            }
+            genericStream.changeAudioSource(mixSource)
+          }
         } else {
           throw IllegalArgumentException("You need min API 29+")
         }
@@ -226,10 +205,16 @@ class ScreenService: Service(), ConnectChecker {
   }
 
   override fun onConnectionSuccess() {
+    bitrateAdapter = BitrateAdapter { bitrate ->
+      genericStream.setVideoBitrateOnFly(bitrate)
+    }.apply {
+      setMaxBitrate(vBitrate + aBitrate)
+    }
     callback?.onConnectionSuccess()
   }
 
   override fun onNewBitrate(bitrate: Long) {
+    bitrateAdapter?.adaptBitrate(bitrate, genericStream.getStreamClient().hasCongestion())
     callback?.onNewBitrate(bitrate)
   }
 
@@ -247,5 +232,9 @@ class ScreenService: Service(), ConnectChecker {
 
   override fun onAuthSuccess() {
     callback?.onAuthSuccess()
+  }
+
+  fun setCallback(callback: ConnectChecker?) {
+    this.callback = callback
   }
 }
